@@ -3,10 +3,11 @@ title: Inference Orchestration Enhancement with Grove Integration
 authors:
   - "kangclzjc"
   - "daisy-ycguo"
+  - "shinedays"
 reviewers:
   - TBD
 creation-date: 2025-12-01
-last-updated: 2025-12-01
+last-updated: 2026-08-17
 status: provisional
 see-also:
   - "/docs/proposals/scheduling/20250611-networktopology-aware-scheduling.md"
@@ -39,6 +40,8 @@ any additional information provided beyond the standard proposal template.
         - [NFR1](#nfr1)
         - [NFR2](#nfr2)
     - [Implementation Details/Notes/Constraints](#implementation-detailsnotesconstraints)
+      - [Phase 1 Implementation Status (Grove-Side Scheduler Backend)](#phase-1-implementation-status-grove-side-scheduler-backend)
+        - [Follow-up scheduler enhancements (CP1–CP5)](#follow-up-scheduler-enhancements-cp1cp5)
     - [Risks and Mitigations](#risks-and-mitigations)
   - [Alternatives](#alternatives)
   - [Upgrade Strategy](#upgrade-strategy)
@@ -62,6 +65,16 @@ This proposal aims to enhance Koordinator's inference orchestration capabilities
 Grove addresses critical gaps in orchestrating modern AI inference systems, including multi-node model deployments (e.g., DeepSeek-R1, Llama-4-Maverick), disaggregated inference architectures (separate prefill/decode stages), and agentic AI pipelines. By integrating Grove's capabilities with Koordinator's existing scheduling features, we can provide a comprehensive solution for managing complex inference workloads at scale, from single GPUs to data centers with tens of thousands of GPUs.
 
 The integration will leverage Koordinator's network topology awareness and resource scheduling capabilities while adopting Grove's orchestration abstractions (PodClique, PodCliqueScalingGroup, PodCliqueSet) to enable hierarchical gang scheduling, startup ordering (via `startsAfter` dependencies), and multi-level autoscaling for inference workloads.
+
+**Update (2026-08)**: the first phase of this integration is implemented and validated. Grove
+now ships a **koord-scheduler backend** that translates each PodGang into Koordinator-native
+resources (sig-scheduling `PodGroup` CRs linked as a GangGroup, gang annotations,
+`ClusterNetworkTopology` synchronisation, ElasticQuota pod labels) inside the Grove operator,
+so Koordinator schedules Grove inference workloads **without any Koordinator-side changes**.
+The implementation was validated against Koordinator v1.8.0 on a kind + KWOK cluster. See
+[Phase 1 Implementation Status](#phase-1-implementation-status-grove-side-scheduler-backend)
+for what works today, the issues encountered, and the follow-up scheduler enhancements
+(CP1–CP5) this phase surfaced.
 
 ## Motivation
 
@@ -103,8 +116,8 @@ Grove (https://github.com/ai-dynamo/grove) provides a proven solution to these c
 
 This proposal introduces Grove integration into Koordinator to enable advanced orchestration of AI inference workloads. The integration strategy involves:
 
-1. **Adopt Grove CRDs**: Deploy Grove's Custom Resource Definitions (PodClique, PodCliqueScalingGroup, PodCliqueSet, PodGang) alongside Koordinator
-2. **Extend Koordinator Scheduler**: Enhance Koordinator's scheduler to recognize and process PodGang scheduling requirements
+1. **Adopt Grove CRDs**: Grove's Custom Resource Definitions (PodClique, PodCliqueScalingGroup, PodCliqueSet, PodGang) are installed by the Grove operator and run alongside Koordinator
+2. **Translate PodGang for the Koordinator Scheduler**: a koord-scheduler backend inside the Grove operator translates each PodGang into Koordinator-native resources (sig-scheduling `PodGroup` CRs linked as a GangGroup, plus gang annotations), so koord-scheduler enforces the gang requirements without code changes; native PodGang consumption in the scheduler remains possible future work
 3. **Leverage Network Topology Plugin**: Integrate Grove's topology-aware placement needs with Koordinator's existing NetworkTopology plugin
 4. **Provide Migration Path**: Enable gradual adoption for users with existing inference workloads
 
@@ -113,8 +126,8 @@ This proposal introduces Grove integration into Koordinator to enable advanced o
 #### Story 1: Multi-Node Disaggregated Inference for Large Models
 
 As an ML platform engineer, I want to deploy a large language model (e.g., DeepSeek-R1 with 671B parameters) using a disaggregated architecture where:
-- Prefill stage runs on 4 nodes (8 GPUs total) with high memory bandwidth
-- Decode stage runs on 8 nodes (16 GPUs total) optimized for throughput
+- Prefill stage runs on 2 nodes (8 GPUs total) with high memory bandwidth
+- Decode stage runs on 4 nodes (16 GPUs total) optimized for throughput
 - All prefill pods must be scheduled together (gang scheduling)
 - All decode pods must be scheduled together (gang scheduling)  
 - At least one prefill replica and one decode replica must be scheduled for the system to be functional (hierarchical gang)
@@ -133,111 +146,100 @@ metadata:
   namespace: inference
   annotations:
     # Koordinator-specific annotations for the entire PodCliqueSet
-    scheduling.koordinator.sh/network-topology-zone: "nvlink-domain-1"
-    scheduling.koordinator.sh/gang-timeout: "600s"
+    scheduling.grove.io/koordinator-schedule-timeout-seconds: "600"  # gang schedule timeout override
+    scheduling.grove.io/koordinator-quota: "inference-quota"         # optional ElasticQuota binding
 spec:
   replicas: 2  # Two complete prefill+decode replica sets
   template:
     terminationDelay: 1m
     cliqueStartupType: CliqueStartupTypeExplicit  # Ensure startup order is honored
+    topologyConstraint:            # topology-aware placement for each replica's gang
+      topologyName: cluster-topology   # references a Grove ClusterTopologyBinding
+      pack:
+        required: rack             # each replica set must land within one rack
     cliques:
       # Prefill stage - processes prompts with high memory bandwidth
       - name: prefill
+        labels:                    # propagated to the clique's pods
+          app: deepseek-r1
+          component: prefill
+          koordinator.sh/qosClass: LS  # Koordinator QoS level (Latency-Sensitive)
         spec:
           roleName: prefill-role
           replicas: 2  # 2 pods, each with 4 GPUs (8 GPUs total)
           # No startsAfter - prefill starts first (no dependencies)
-          podSpec:
-            metadata:
-              labels:
-                app: deepseek-r1
-                component: prefill
-              annotations:
-                # Koordinator network topology annotation for fine-grained placement
-                gang.scheduling.koordinator.sh/network-topology-index: "0"
-                # Request specific QoS level
-                scheduling.koordinator.sh/qos-class: "LS"  # Latency-Sensitive
-            spec:
-              schedulerName: koord-scheduler
-              containers:
-              - name: prefill-server
-                image: deepseek/r1-prefill:v1.0
-                resources:
-                  requests:
-                    cpu: "32"
-                    memory: "256Gi"
-                    nvidia.com/gpu: "4"
-                  limits:
-                    cpu: "32"
-                    memory: "256Gi"
-                    nvidia.com/gpu: "4"
-                env:
-                - name: MODEL_STAGE
-                  value: "prefill"
-                - name: DECODE_ENDPOINT
-                  value: "deepseek-r1-decode-service:8000"
-                ports:
-                - containerPort: 8000
-                  name: grpc
-                volumeMounts:
-                - name: model-cache
-                  mountPath: /models
-              volumes:
+          podSpec:     # a plain corev1.PodSpec
+            schedulerName: koord-scheduler
+            containers:
+            - name: prefill-server
+              image: deepseek/r1-prefill:v1.0
+              resources:
+                requests:
+                  cpu: "32"
+                  memory: "256Gi"
+                  nvidia.com/gpu: "4"
+                limits:
+                  cpu: "32"
+                  memory: "256Gi"
+                  nvidia.com/gpu: "4"
+              env:
+              - name: MODEL_STAGE
+                value: "prefill"
+              - name: DECODE_ENDPOINT
+                value: "deepseek-r1-decode-service:8000"
+              ports:
+              - containerPort: 8000
+                name: grpc
+              volumeMounts:
               - name: model-cache
-                emptyDir:
-                  sizeLimit: 100Gi
+                mountPath: /models
+            volumes:
+            - name: model-cache
+              emptyDir:
+                sizeLimit: 100Gi
 
       # Decode stage - generates tokens optimized for throughput
       - name: decode
+        labels:
+          app: deepseek-r1
+          component: decode
+          koordinator.sh/qosClass: LS
         spec:
           roleName: decode-role
           replicas: 4  # 4 pods, each with 4 GPUs (16 GPUs total)
           startsAfter:  # Start decode pods only after prefill is ready
             - prefill
           podSpec:
-            metadata:
-              labels:
-                app: deepseek-r1
-                component: decode
-              annotations:
-                # Schedule decode pods after prefill in topology placement
-                gang.scheduling.koordinator.sh/network-topology-index: "1"
-                scheduling.koordinator.sh/qos-class: "LS"
-            spec:
-              schedulerName: koord-scheduler
-              # Grove will inject init container to enforce startsAfter dependency:
-              # initContainers:
-              # - name: wait-for-prefill
-              #   image: grove/startup-coordinator:v1.0
-              #   command: ["/wait-for-podclique"]
-              #   args: ["--podclique=prefill"]
-              containers:
-              - name: decode-server
-                image: deepseek/r1-decode:v1.0
-                resources:
-                  requests:
-                    cpu: "24"
-                    memory: "192Gi"
-                    nvidia.com/gpu: "4"
-                  limits:
-                    cpu: "24"
-                    memory: "192Gi"
-                    nvidia.com/gpu: "4"
-                env:
-                - name: MODEL_STAGE
-                  value: "decode"
-                - name: PREFILL_ENDPOINT
-                  value: "deepseek-r1-prefill-service:8000"
-                ports:
-                - containerPort: 8000
-                  name: grpc
-                volumeMounts:
-                - name: model-cache
-                  mountPath: /models
-              volumes:
+            schedulerName: koord-scheduler
+            # Grove will inject its init container to enforce the startsAfter
+            # dependency (image comes from the operator's configuration)
+            containers:
+            - name: decode-server
+              image: deepseek/r1-decode:v1.0
+              resources:
+                requests:
+                  cpu: "24"
+                  memory: "192Gi"
+                  nvidia.com/gpu: "4"
+                limits:
+                  cpu: "24"
+                  memory: "192Gi"
+                  nvidia.com/gpu: "4"
+              env:
+              - name: MODEL_STAGE
+                value: "decode"
+              - name: PREFILL_ENDPOINT
+                value: "deepseek-r1-prefill-service:8000"
+              ports:
+              - containerPort: 8000
+                name: grpc
+              volumeMounts:
               - name: model-cache
-                emptyDir:
-                  sizeLimit: 50Gi
+                mountPath: /models
+            volumes:
+            - name: model-cache
+              emptyDir:
+                sizeLimit: 50Gi
     
     podCliqueScalingGroups:
     - name: disaggregated-inference
@@ -247,37 +249,21 @@ spec:
         - decode
 ---
 # Example: How Grove Implements Startup Ordering with startsAfter
-# 
-# For the decode PodClique with `startsAfter: [prefill]`, Grove will inject
-# an init container into each decode pod:
 #
-# apiVersion: v1
-# kind: Pod
-# metadata:
-#   name: deepseek-r1-disaggregated-0-decode-0
-#   annotations:
-#     grove.io/starts-after: "prefill"
-# spec:
-#   initContainers:
-#   - name: wait-for-prefill
-#     image: grove/startup-coordinator:v1.0
-#     command: ["/wait-for-podclique"]
-#     args:
-#     - "--namespace=inference"
-#     - "--podclique=prefill"
-#     - "--podcliqueset=deepseek-r1-disaggregated"
-#     - "--replica-index=0"
-#     # This init container queries the API server and waits until all pods
-#     # in the "prefill" PodClique reach Ready state before exiting
-#   containers:
-#   - name: decode-server
-#     # ... main container starts only after init container completes
+# For the decode PodClique with `startsAfter: [prefill]`, the Grove operator
+# injects an init container into each decode pod. The init container watches
+# the API server and exits only once all pods in the "prefill" PodClique of
+# the same PodCliqueSet replica reach Ready state, so the decode-server main
+# container starts strictly after prefill is up. The init container image is
+# configured on the operator (GROVE_INIT_CONTAINER_IMAGE); the Koordinator
+# scheduler is not involved in startup ordering.
 ---
-# Grove operator will create PodGang CR for Koordinator scheduler
-apiVersion: scheduling.grove.io/v1alpha1
+# Grove operator creates one PodGang per PodCliqueSet replica; the name embeds a
+# runtime-minted epoch: {pcs}-{replicaIndex}-{epoch}
+apiVersion: scheduler.grove.io/v1alpha1
 kind: PodGang
 metadata:
-  name: deepseek-r1-disaggregated-0
+  name: deepseek-r1-disaggregated-0-1756100000000000000
   namespace: inference
   ownerReferences:
   - apiVersion: grove.io/v1alpha1
@@ -285,14 +271,30 @@ metadata:
     name: deepseek-r1-disaggregated
     uid: <generated-uid>
 spec:
-  schedulerName: koord-scheduler
-  minAvailable: 1  # At least 1 complete set of prefill+decode
-  subGroups:
-  - minMember: 2
-    name: prefill
-  - minMember: 4
-    name: decode
+  podgroups:                       # one entry per PodClique
+  - name: deepseek-r1-disaggregated-0-prefill
+    minReplicas: 2                 # gang-scheduling floor for this clique
+    podReferences:
+    - name: deepseek-r1-disaggregated-0-prefill-abc12
+      namespace: inference
+    # ... one reference per prefill pod
+  - name: deepseek-r1-disaggregated-0-decode
+    minReplicas: 4
+    podReferences:
+    - name: deepseek-r1-disaggregated-0-decode-xyz34
+      namespace: inference
+    # ... one reference per decode pod
+  topologyConstraint:              # translated from the PCS topologyConstraint;
+    packConstraint:                # the operator resolves the level name to a node label key
+      required: topology.kubernetes.io/rack
 ```
+
+The Grove koord-scheduler backend then materialises this PodGang as one Koordinator
+`PodGroup` CR per entry in `podgroups` (with `minMember` taken from `minReplicas`), links
+them into a single atomic GangGroup, and stamps each pod with the
+`gang.scheduling.koordinator.sh/name` annotation — see
+[Phase 1 Implementation Status](#phase-1-implementation-status-grove-side-scheduler-backend)
+for the full mapping.
 
 #### Story 2: Agentic AI Pipeline with Multiple Models
 
@@ -316,7 +318,6 @@ metadata:
   name: agentic-pipeline
 spec:
   replicas: 1
-  schedulerName: koord-scheduler
   template:
     cliqueStartupType: CliqueStartupTypeExplicit
     cliques:
@@ -327,14 +328,15 @@ spec:
         replicas: 1
         # No startsAfter - starts immediately after scheduling
         podSpec:
-          spec:
-            schedulerName: koord-scheduler
-            containers:
-            - name: vision-model
-              image: vision-model:latest
-              resources:
-                requests:
-                  nvidia.com/gpu: 2
+          schedulerName: koord-scheduler
+          containers:
+          - name: vision-model
+            image: vision-model:latest
+            resources:
+              requests:
+                nvidia.com/gpu: 2
+              limits:
+                nvidia.com/gpu: 2
     
     - name: reasoning
       spec:
@@ -342,14 +344,15 @@ spec:
         replicas: 1
         # No startsAfter - starts immediately after scheduling
         podSpec:
-          spec:
-            schedulerName: koord-scheduler
-            containers:
-            - name: reasoning-model
-              image: reasoning-model:latest
-              resources:
-                requests:
-                  nvidia.com/gpu: 4
+          schedulerName: koord-scheduler
+          containers:
+          - name: reasoning-model
+            image: reasoning-model:latest
+            resources:
+              requests:
+                nvidia.com/gpu: 4
+              limits:
+                nvidia.com/gpu: 4
     
     - name: code-gen
       spec:
@@ -357,14 +360,15 @@ spec:
         replicas: 1
         # No startsAfter - starts immediately after scheduling
         podSpec:
-          spec:
-            schedulerName: koord-scheduler
-            containers:
-            - name: code-gen-model
-              image: code-gen:latest
-              resources:
-                requests:
-                  nvidia.com/gpu: 2
+          schedulerName: koord-scheduler
+          containers:
+          - name: code-gen-model
+            image: code-gen:latest
+            resources:
+              requests:
+                nvidia.com/gpu: 2
+              limits:
+                nvidia.com/gpu: 2
     
     # Router waits for all specialized models to be ready
     - name: router
@@ -376,14 +380,15 @@ spec:
           - reasoning
           - code-gen
         podSpec:
-          spec:
-            schedulerName: koord-scheduler
-            containers:
-            - name: router-model
-              image: router:latest
-              resources:
-                requests:
-                  nvidia.com/gpu: 1
+          schedulerName: koord-scheduler
+          containers:
+          - name: router-model
+            image: router:latest
+            resources:
+              requests:
+                nvidia.com/gpu: 1
+              limits:
+                nvidia.com/gpu: 1
     
     podCliqueScalingGroups:
     - name: ai-pipeline
@@ -416,25 +421,37 @@ Using Grove's PodClique with `startsAfter` dependencies and Koordinator's topolo
 
 **MUST**: Koordinator scheduler must recognize and enforce PodGang scheduling constraints with support for hierarchical gang requirements (gang of gangs). If minimum replica requirements cannot be satisfied at any level, no pods in the gang should be scheduled.
 
+> **Status (2026-08, phase 1)**: Partial. Two levels work today (per-clique PodGroups linked as one GangGroup); per-sub-group topology placement (gang of gangs) is blocked by the single-NetworkTopologySpec-per-GangGroup behaviour — see CP1/CP2 in [Follow-up scheduler enhancements](#follow-up-scheduler-enhancements-cp1cp5).
+
 ##### FR2: Startup Ordering
 
 **MUST**: Support explicit startup ordering within PodCliqueScalingGroups using Grove's `startsAfter` field. Dependent pods must not start until prerequisite pods reach Ready state. This is enforced by Grove operator through init containers, not by the scheduler.
+
+> **Status (2026-08, phase 1)**: Satisfied (Grove operator responsibility; works unchanged with the backend path).
 
 ##### FR3: Topology-Aware Placement for Grove Workloads  
 
 **MUST**: Integrate Grove's placement requirements with Koordinator's NetworkTopology plugin to prefer scheduling pods within the same NVLink domain, network zone, or other topology levels as specified.
 
+> **Status (2026-08, phase 1)**: Satisfied via ClusterNetworkTopology synchronisation and gang topology annotations (MustGather rack packing verified end-to-end on v1.8.0, with koord-scheduler running `--enable-network-topology-manager=true` — the tree manager is off by default); multi-topology clusters are limited by the `default` CNT singleton — see CP3.
+
 ##### FR4: Multi-Level Autoscaling
 
 **SHOULD**: Support autoscaling at both PodClique level (scaling individual components) and PodCliqueSet level (scaling entire inference systems as units).
+
+> **Status (2026-08, phase 1)**: Satisfied (Grove operator responsibility; the scheduler observes updated PodGangs/PodGroups).
 
 ##### FR5: Reservation Compatibility
 
 **MUST**: Grove-managed pods must be compatible with Koordinator's Reservation mechanism for resource pre-allocation and guaranteed scheduling.
 
+> **Status (2026-08, phase 1)**: Open. Koordinator's pre-allocation mechanics are sufficient, but Grove's `ReuseReservationRef` field has no producer yet — see CP4.
+
 ##### FR6: API Compatibility
 
 **MUST**: Adopt Grove's upstream API definitions without breaking changes. Koordinator-specific extensions should use annotations or separate CRDs.
+
+> **Status (2026-08, phase 1)**: Satisfied. Grove APIs are consumed as-is; Koordinator-specific configuration reaches pods only via annotations and labels (no CRD changes on either side).
 
 #### Non-Functional Requirements
 
@@ -450,31 +467,39 @@ The integration follows a layered approach:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     User Applications                        │
+│                    User Applications                        │
 │         (PodCliqueSet, PodClique, PodGang CRs)              │
 └─────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   Grove Operator                             │
+│                  Grove Operator                             │
 │  • Manages PodCliqueSet lifecycle                           │
 │  • Creates PodCliques and PodGangs                          │
 │  • Handles autoscaling logic                                │
 │  • Enforces startup ordering                                │
+│  • koord-scheduler backend (phase 1):                       │
+│    – PodGang → PodGroup CRs linked as a GangGroup           │
+│    – ClusterTopologyBinding → ClusterNetworkTopology sync   │
+│    – injects gang/quota/QoS annotations and labels on pods  │
+└─────────────────────────────────────────────────────────────┘
+                            │
+              PodGroups + gang annotations,
+              ClusterNetworkTopology, pods
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│             Koordinator Scheduler (unmodified)              │
+│  • Coscheduling plugin (PodGroup + GangGroup gang)          │
+│  • Coscheduling network-topology workflow (placement via    │
+│    the NetworkTopology tree manager, opt-in by flag)        │
+│  • ElasticQuota plugin (quota enforcement)                  │
+│  • Reservation plugin (future work, CP4)                    │
 └─────────────────────────────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Koordinator Scheduler                           │
-│  • Gang scheduling plugin (PodGang-aware)                   │
-│  • NetworkTopology plugin (topology placement)              │
-│  • Reservation plugin (resource guarantee)                  │
-│  • Coscheduling plugin (hierarchical gang)                  │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 Kubernetes API Server                        │
+│                Kubernetes API Server                        │
 │                    (Pods, Nodes)                            │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -483,34 +508,57 @@ The integration follows a layered approach:
 
 ##### 1. CRD Integration
 
-- **Deploy Grove CRDs**: Include Grove's CRD definitions in Koordinator installation
+- **Grove CRDs**: installed and owned by the Grove operator (Koordinator installation does
+  not bundle them; no Koordinator CRD changes)
   - `PodClique`: Defines a group of homogeneous pods with a specific role
   - `PodCliqueScalingGroup`: Groups multiple PodCliques for gang scheduling
   - `PodCliqueSet`: Top-level resource for managing inference systems
-  - `PodGang`: Scheduling API consumed by Koordinator scheduler
+  - `PodGang`: Grove's scheduling-intent API, consumed by the Grove koord-scheduler backend
+    and translated into Koordinator-native resources (koord-scheduler never reads PodGang)
 
-- **Annotation Extensions**: Use annotations for Koordinator-specific behaviors
-  - `scheduling.koordinator.sh/network-topology-zone`: Specify preferred topology zones
-  - `scheduling.koordinator.sh/reservation-ref`: Link to Reservation resources
-  - `scheduling.koordinator.sh/gang-timeout`: Override default gang scheduling timeout
+- **Annotations and labels**: Koordinator-specific behaviors are configured on Grove
+  workloads and materialised as Koordinator's existing keys — no new Koordinator API
+  - `scheduling.grove.io/koordinator-quota` (PodCliqueSet/PodClique annotation): binds the
+    workload to an ElasticQuota; the backend injects the `quota.scheduling.koordinator.sh/name`
+    label on every pod (validated at admission, immutable for the workload's lifetime)
+  - `scheduling.grove.io/koordinator-schedule-timeout-seconds` (PodCliqueSet annotation):
+    overrides the profile-level gang schedule timeout for the workload
+  - `koordinator.sh/qosClass` (pod label, set per-clique via the clique template's
+    `labels` field — propagated to the clique's pods — or via a profile-level default):
+    Koordinator QoS class
+  - On the generated PodGroups the backend writes Koordinator's existing gang annotations
+    (`gang.scheduling.koordinator.sh/groups`, `mode`, `match-policy`, `total-number`,
+    `network-topology-spec`), and on pods the `gang.scheduling.koordinator.sh/name`
+    association annotation
 
 ##### 2. Scheduler Enhancements
 
-**Gang Scheduling Plugin Extension**:
-- Extend existing Coscheduling plugin to understand PodGang CRs
-- Implement hierarchical gang validation:
+**Gang scheduling (phase 1 — no scheduler changes)**:
+- The Grove backend encodes PodGang's hierarchical gang requirements onto Koordinator's
+  existing Coscheduling plugin:
   ```
-  PodGang (top level)
-    ├─ PodGroup (prefill clique)
-    │   └─ min replicas: 4
-    └─ PodGroup (decode clique)  
-        └─ min replicas: 8
+  PodGang (one per PodCliqueSet replica)
+    ├─ PodGroup CR (prefill clique) — minMember: 2
+    └─ PodGroup CR (decode clique) — minMember: 4
+        ↑ linked into one atomic GangGroup via gang.scheduling.koordinator.sh/groups
   ```
-- If any sub-group cannot meet minimum replicas, reject the entire PodGang
-- Support gang-level scheduling timeout with graceful cleanup
+- If any member PodGroup cannot meet `minMember`, the whole GangGroup is held back — no pod
+  in the gang binds
+- Gang-level scheduling timeout is supported via `scheduleTimeoutSeconds` on the generated
+  PodGroups (profile default + per-workload annotation override)
+- Native PodGang consumption inside the scheduler remains a possible later phase; the
+  scheduler-side enhancements this phase surfaced are listed as CP1–CP5 in
+  [Follow-up scheduler enhancements](#follow-up-scheduler-enhancements-cp1cp5)
 
 **Topology-Aware Placement**:
-- Integrate with existing NetworkTopology plugin
+- Uses the Coscheduling plugin's existing network-topology workflow as-is (backed by the
+  frameworkext NetworkTopology tree manager): the backend syncs Grove's
+  `ClusterTopologyBinding` into the `default` `ClusterNetworkTopology` CR and translates
+  Grove pack constraints into the `network-topology-spec` gang annotation
+  (`Required`→`MustGather`, `Preferred`→`PreferGather`)
+- Requires koord-scheduler to run with `--enable-network-topology-manager=true` (default
+  `false`): without it the topology tree is never built and any gang carrying a
+  `network-topology-spec` annotation fails PreFilter with "no cluster network topology"
 
 **Startup Ordering**:
 - Grove uses the `startsAfter` field in PodClique spec to define startup dependencies
@@ -523,7 +571,8 @@ The integration follows a layered approach:
 ##### 3. Controller Coordination
 
 **Grove Operator**:
-- Grove creates PodGang CRs consumed by Koordinator scheduler
+- Grove creates PodGang CRs; its koord-scheduler backend materialises them as Koordinator
+  PodGroups (and keeps them in sync across scaling and rolling updates)
 - Grove manages autoscaling based on metrics (CPU, GPU, custom metrics)
 
 ##### 4. Autoscaling Integration
@@ -548,12 +597,14 @@ apiVersion: grove.io/v1alpha1
 kind: PodCliqueSet
 metadata:
   name: llama-inference
-  annotations:
-    scheduling.koordinator.sh/network-topology-zone: nvlink-domain-1
 spec:
   replicas: 2  # Two complete prefill+decode systems
   template:
     cliqueStartupType: CliqueStartupTypeExplicit
+    topologyConstraint:
+      topologyName: cluster-topology  # Grove ClusterTopologyBinding, synced to Koordinator's ClusterNetworkTopology
+      pack:
+        preferred: rack               # best-effort: pack each replica's gang within one rack
     cliques:
     - name: prefill
       spec:
@@ -561,14 +612,15 @@ spec:
         replicas: 4
         # No startsAfter - prefill starts first
         podSpec:
-          spec:
-            schedulerName: koord-scheduler
-            containers:
-            - name: prefill
-              image: llama-prefill:latest
-              resources:
-                requests:
-                  nvidia.com/gpu: 2
+          schedulerName: koord-scheduler
+          containers:
+          - name: prefill
+            image: llama-prefill:latest
+            resources:
+              requests:
+                nvidia.com/gpu: 2
+              limits:
+                nvidia.com/gpu: 2
     - name: decode
       spec:
         roleName: decode-role
@@ -576,14 +628,15 @@ spec:
         startsAfter:  # Start decode after prefill is ready
           - prefill
         podSpec:
-          spec:
-            schedulerName: koord-scheduler
-            containers:
-            - name: decode
-              image: llama-decode:latest
-              resources:
-                requests:
-                  nvidia.com/gpu: 2
+          schedulerName: koord-scheduler
+          containers:
+          - name: decode
+            image: llama-decode:latest
+            resources:
+              requests:
+                nvidia.com/gpu: 2
+              limits:
+                nvidia.com/gpu: 2
     podCliqueScalingGroups:
     - name: inference-pipeline
       minAvailable: 1  # At least one complete pipeline
@@ -601,7 +654,6 @@ metadata:
   name: mpi-inference
 spec:
   replicas: 1
-  schedulerName: koord-scheduler
   template:
     cliqueStartupType: CliqueStartupTypeExplicit
     cliques:
@@ -611,11 +663,10 @@ spec:
         replicas: 8
         # No startsAfter - workers start first
         podSpec:
-          spec:
-            schedulerName: koord-scheduler
-            containers:
-            - name: mpi-worker
-              image: mpi-worker:latest
+          schedulerName: koord-scheduler
+          containers:
+          - name: mpi-worker
+            image: mpi-worker:latest
     - name: leader
       spec:
         roleName: leader-role
@@ -623,11 +674,10 @@ spec:
         startsAfter:  # Leader waits for all workers to be ready
           - worker
         podSpec:
-          spec:
-            schedulerName: koord-scheduler
-            containers:
-            - name: mpi-leader
-              image: mpi-leader:latest
+          schedulerName: koord-scheduler
+          containers:
+          - name: mpi-leader
+            image: mpi-leader:latest
     podCliqueScalingGroups:
     - name: mpi-job
       minAvailable: 1
@@ -636,11 +686,95 @@ spec:
         - leader
 ```
 
+#### Phase 1 Implementation Status (Grove-Side Scheduler Backend)
+
+The first phase of this proposal is implemented on the Grove side: instead of extending
+the Koordinator scheduler to consume PodGang natively, the Grove operator ships a
+**koord-scheduler backend** that translates PodGangs into resources Koordinator already
+understands (as described in Component Changes above). This required **zero Koordinator
+changes**, is validated against Koordinator v1.8.0, and isolates the remaining
+scheduler-side work into the concrete enhancements listed at the end of this section.
+Native PodGang consumption remains a possible later phase; the enhancements below are
+useful under either architecture.
+
+**What works today** (Grove branch `feat/koordinator-scheduler-backend`, enabled via a
+`koord-scheduler` profile in the Grove operator configuration):
+
+| Capability | Mechanism |
+|---|---|
+| Gang scheduling | PodGang → one `PodGroup` CR per PodClique, linked into one atomic gang via `gang.scheduling.koordinator.sh/groups`; `minMember` from Grove `minReplicas` |
+| Pod→gang association | `gang.scheduling.koordinator.sh/name` **annotation** on pods (the `GetGangName` fallback chain; the `pod-group.scheduling.sigs.k8s.io` label is avoided because Grove-derived names can exceed the 63-character label value limit) |
+| Topology-aware placement | Grove `ClusterTopologyBinding` synchronised into the `default` `ClusterNetworkTopology` (spec only; status stays owned by koord-scheduler); pack constraints map to the `network-topology-spec` gang annotation (`Required`→`MustGather`, `Preferred`→`PreferGather`) with automatic node-label-key → layer-name mapping |
+| ElasticQuota | A Grove workload annotation injects the `quota.scheduling.koordinator.sh/name` pod label, with admission-time validation that the quota exists and is a leaf; the binding is immutable per workload lifetime |
+| QoS / gang timeout | Per-PodClique `koordinator.sh/qosClass` labels; profile-level `scheduleTimeoutSeconds` plus a per-workload annotation override |
+| Rolling updates | Grove's coherent updates zero `minReplicas` to release constraints; the backend preserves recorded `minMember`/`total-number` on existing PodGroups so gang semantics never lapse mid-rollout |
+| Dual-writer hygiene | PodGroup updates carry over the status written by Koordinator's PodGroupController (the CRD has no status subresource) and preserve externally managed metadata |
+
+The backend relies on four verified Koordinator contracts: (1) gang name resolution goes
+through `extension.GetGangName` (label → deprecated label → annotation) in both the gang
+cache and the PodGroupController; (2) the GangGroup scheduling context is created by the
+first member pod entering PreFilter and its single `NetworkTopologySpec` applies to the
+whole GangGroup; (3) the `ClusterNetworkTopology` spec is administrator-owned and only the
+CNT named `default` is consumed; (4) an unknown ElasticQuota name silently falls back to
+`koordinator-default-quota` (absent the alpha `DisableDefaultQuota` gate). Stabilising these
+surfaces (or release-noting changes to them) would protect all external integrators.
+
+**Issues encountered during implementation** (practical input to the requirements above):
+
+| # | Issue | Resolution |
+|---|---|---|
+| I1 | Single NetworkTopologySpec per GangGroup: per-sub-group and divergent per-clique constraints apply non-deterministically (first pod into PreFilter wins) | **Open — main blocker for FR1.** Grove rejects both divergent per-clique constraints and all PCSG sub-group topology constraints at admission (fail-closed rather than silently degraded); scheduler-side fix proposed as CP1 |
+| I2 | 63-character label limit vs. derived gang names (two concatenated FQNs) | Solved in Grove by switching to the `gang.scheduling.koordinator.sh/name` annotation |
+| I3 | `ClusterNetworkTopology` name hardcoded to `default` — one topology definition per cluster | **Open** → CP3 |
+| I4 | PodGroup CRD has no status subresource: whole-object updates from any external controller wipe PodGroupController-maintained status | Worked around in Grove (status carry-over). Adding `subresources.status` would protect all integrators, but requires migrating Koordinator's own status writes to the `/status` endpoint — a coordinated change |
+| I5 | ElasticQuota silently falls back to the default quota for unknown names | Mitigated in Grove by admission-time validation; a scheduler-side event on unknown-quota pods could help non-Grove users too |
+| I6 | `gang has not init` transient when a pod reaches the scheduler before its PodGroup CR exists | Self-heals via the gang cache re-enqueue; needs only a docs note |
+| I7 | Topology layer names are administrator-defined, not a built-in vocabulary (only `NodeTopologyLayer`/`ClusterTopologyLayer` are built in) | Solved in Grove by deriving layer names from the synced CNT; an integrator-pitfall docs note would help |
+| I8 | `ReuseReservationRef` has no consumer path | Open on the Grove side (no producer yet) → CP4 |
+
+##### Follow-up scheduler enhancements (CP1–CP5)
+
+Ordered by impact; each is independently useful and applies to both the backend path and a
+future native PodGang path:
+
+- **CP1 — Per-sub-group NetworkTopologySpec within a GangGroup** (implements FR1's
+  gang-of-gangs placement). Minimal annotation-level API: extend the
+  `network-topology-spec` gang annotation with a `subGroups` list (per-sub-group
+  `gatherStrategy`), plus a pod annotation naming its sub-group; `FindOneNode` partitions
+  pending pods by sub-group and solves each partition within the candidate subtree selected
+  by the whole-gang constraint (a generalisation of the existing PP-group /
+  `podCountMultiple` mechanics).
+- **CP2 — Declarative contract for `podCountMultiple` contiguous placement**: today the
+  solver's `distributeOfferSlot` + `distributePods` pair happens to fill one topology domain
+  before advancing to the next, so each contiguous chunk of N name-ordered pods lands in one
+  domain (the pods are sorted by name; the domains themselves are ordered by
+  `topologyNodeLessFunc`). Documenting and regression-testing that placement property would
+  let integrators approximate homogeneous sub-group packing until CP1 lands — and #3191 now
+  logs the resulting pod→node placement, so the property is already observable in practice.
+- **CP3 — Configurable / multiple `ClusterNetworkTopology` instances**: allow the consumed
+  CNT name to be configured, or select a CNT per gang via an annotation.
+- **CP4 — Reservation integration for Grove rolling updates** (FR5): Koordinator's
+  mechanics (`preAllocation` with the Cluster policy selecting the running pods whose
+  resources are pre-allocated, owner matching selecting the consumer pods, soft scoring
+  preference) already map onto "suggest, don't require" reuse semantics, and #3184 moved
+  DeviceShare in the same direction — a pod nominated to a reservation that tracks no device
+  allocation now falls back to the node's unallocated devices instead of being rejected.
+  Remaining blocker is on the Grove side: defining producer semantics for
+  `ReuseReservationRef`.
+- **CP5 — Minor items**: document the `gang has not init` transient; a heads-up policy for
+  a future PodGroup CRD v1beta1 (integrators consume v1alpha1 via unstructured clients);
+  confirm the SYSTEM QoS class is reserved for system daemons (the Grove backend
+  deliberately restricts to LSE/LSR/LS/BE).
+
 #### Constraints and Limitations
 
 1. **Scheduling Complexity**: Hierarchical gang scheduling with topology awareness is computationally expensive. Large gangs (>100 pods) may experience increased scheduling latency.
 
 2. **Startup Ordering Delays**: Strict startup ordering may increase total deployment time. Users should set appropriate timeouts.
+
+3. **Single NetworkTopologySpec per GangGroup** (phase 1 finding): until CP1 lands, all
+   cliques of one gang must share the same effective topology constraint; the Grove backend
+   rejects divergent constraints at admission.
 
 ### Risks and Mitigations
 
@@ -675,10 +809,14 @@ spec:
 **Risk**: Grove's gang scheduling might conflict with Koordinator's Reservation, Preemption, or ElasticQuota features.
 
 **Mitigation**:
-- Conduct thorough integration testing with all existing Koordinator features
+- Conduct thorough integration testing with all existing Koordinator features (phase 1:
+  quota-exhaustion and preemption interplay are listed as known validation gaps)
 - Document known limitations and incompatibilities clearly
-- Implement feature gates to allow gradual rollout and easy rollback
-- Add validation webhooks to reject invalid configurations early
+- The backend is opt-in per Grove scheduler profile — gradual rollout and easy rollback
+  without any Koordinator feature gate
+- Validation webhooks reject invalid configurations early (implemented in phase 1:
+  admission validation for QoS/timeout/quota values, quota existence, and divergent or
+  unsupported topology constraints)
 
 
 ## Alternatives
@@ -730,52 +868,67 @@ Adopt RBG (https://github.com/sgl-project/rbg), a Kubernetes API specifically de
 
 ## Upgrade Strategy
 
+The phase-1 integration lives entirely in the Grove operator: it requires no Koordinator
+feature gate or code changes, and no Koordinator upgrade beyond running a version with the
+Coscheduling, ElasticQuota, and network-topology capabilities (validated against v1.8.0).
+Gang scheduling and ElasticQuota work with a stock koord-scheduler; topology-aware
+placement additionally requires starting koord-scheduler with
+`--enable-network-topology-manager=true` (default `false`). Everything else — enablement
+and rollback — is Grove-side configuration.
+
 ### Upgrade from Previous Koordinator Versions
 
 **For clusters NOT using Grove features**:
 - No changes required - Grove integration is opt-in
 - Existing workloads continue to function normally
-- Grove CRDs are installed but unused
+- No Grove CRDs are added to the Koordinator installation
 - No performance impact on non-Grove workloads
 
 **For clusters adopting Grove features**:
-- Install Grove operator (can be done before or after Koordinator upgrade)
-- Enable Grove feature gate in Koordinator scheduler: `--feature-gates=GroveIntegration=true`
-- Update scheduler configuration to include Grove-aware plugins
+- Install the Grove operator (can be done before or after any Koordinator upgrade)
+- Add a `koord-scheduler` scheduler profile to the Grove operator configuration; the
+  operator's Helm chart grants the PodGroup/ElasticQuota/ClusterNetworkTopology RBAC only
+  when the profile is enabled
+- If using topology-aware placement, add `--enable-network-topology-manager=true` to the
+  koord-scheduler args; no other scheduler flags or plugin changes are needed
 - No changes to existing Grove CRDs if already using Grove standalone
 
 ### Migration from Standalone Grove to Koordinator+Grove
 
-Users already running Grove without Koordinator can migrate gradually:
+Users already running Grove with another scheduler backend can migrate gradually:
 
-1. Install Koordinator alongside existing Grove installation
-2. Enable Koordinator scheduler as secondary scheduler initially
-3. Test with new workloads using Koordinator+Grove
-4. Migrate existing PodCliqueSet resources to use Koordinator scheduler via annotation:
+1. Install Koordinator alongside the existing Grove installation
+2. Add the `koord-scheduler` profile to the Grove operator configuration (existing
+   workloads on other backends are unaffected — the backend is selected per workload)
+3. Test with new workloads: set `schedulerName: koord-scheduler` in the clique pod
+   templates of a new PodCliqueSet
    ```yaml
-   metadata:
-     annotations:
-       schedulerName: koord-scheduler
+   cliques:
+   - name: prefill
+     spec:
+       podSpec:
+         schedulerName: koord-scheduler   # podSpec is a plain corev1.PodSpec
    ```
-5. Monitor and validate functionality
-6. Gradually migrate all workloads
-7. Deprecate standalone scheduler if desired
-
-
-**Feature Gate (temporary, during alpha/beta)**:
-```bash
---feature-gates=GroveEnable=true
-```
+4. Monitor and validate functionality
+5. Gradually migrate remaining workloads (switching an existing workload's scheduler means
+   recreating it — the backend choice is fixed at workload creation)
+6. Decommission the previous scheduler backend if desired
 
 ### Rollback Strategy
 
-If issues arise during upgrade:
+If issues arise during adoption:
 
-1. Disable Grove feature gate: `--feature-gates=GroveEnable=false`
-2. Scheduler will ignore PodGang resources and fall back to standard scheduling
-3. Existing Grove-managed pods continue running (no disruption)
-4. New PodCliqueSet creation will fail until issue is resolved
-5. Can roll back Koordinator to previous version without data loss (Grove CRDs remain)
+1. Point new workloads back at the previous scheduler backend (`schedulerName` in the
+   clique pod specs); recreate affected workloads
+2. Existing running pods continue running until a pod needs replacing — generated
+   PodGroups are garbage-collected with their PodGangs when workloads are deleted
+3. Removing the `koord-scheduler` profile from the Grove operator configuration blocks new
+   PodCliqueSets (and updates to existing ones) that reference it at admission. It does
+   not cleanly quarantine existing PodCliqueSets that still reference it: their pod
+   reconciliation errors (no replacement or scale-up pods can be created) and their
+   PodGangs fall back to the default backend's sync logic — migrate or delete
+   koord-scheduler-backed workloads **before** removing the profile
+4. Koordinator itself needs no rollback — it was never modified
 
 ## Additional Details
 
@@ -826,6 +979,40 @@ If issues arise during upgrade:
   - Downgrade and verify existing workloads continue running
   - Migrate from standalone Grove to Koordinator+Grove
 
+#### Phase 1 Validation Results (2026-08)
+
+Executed on a kind cluster + 10 KWOK fake nodes with Koordinator v1.8.0 (official Helm
+chart, koord-scheduler additionally started with `--enable-network-topology-manager=true`
+for the topology scenarios) and the Grove operator with the `koord-scheduler` profile:
+
+- **Unit tests** (Grove repository): gang translation and idempotent re-sync; dual-writer
+  hygiene (status carry-over, external metadata preservation, owner-UID overwrite refusal);
+  two-pass stale-PodGroup pruning with failure injection (a mid-loop create failure aborts
+  before prune); rolling-update constraint preservation; topology annotation translation
+  (including divergence rejection and exact key matching); CTB→CNT synchronisation and
+  structural drift checks; ElasticQuota resolution/immutability matrix; all admission
+  validations with migration-aware update semantics.
+- **E2E** (KGS1–4): basic gang reaches Running with correct gang annotations; all-cordoned
+  cluster blocks the whole gang, uncordon releases it; MNNVL enrollment and unknown-quota
+  references rejected by the webhook. The suite self-skips on clusters without Koordinator.
+- **Live end-to-end**: pods carry quota labels and reach Running; per-workload timeout
+  reflected in `PodGroup.spec.scheduleTimeoutSeconds`; CTB creation produced the `default`
+  CNT, **koord-scheduler wrote its status** (topology tree built), Grove reported
+  `inSync: true`, and a Required(rack) workload landed entirely within one rack
+  (MustGather honoured) with automatically derived layer names.
+- **Known gaps** (not yet verified end-to-end): gang schedule-timeout expiry behaviour
+  under Strict mode (highest priority); NonStrict mode and non-default matchPolicy;
+  live coherent rolling updates; multi-replica / PCSG-scaled workloads on a cluster;
+  quota exhaustion and preemption interplay; Koordinator write-backs — PreBind
+  `bind-gang-*` pod annotations were observed incidentally, not systematically asserted
+  against Grove's reconcile loops (that patch path gained configurable backoff retries in
+  #3179, making the write-back more reliable but still asynchronous relative to Grove's
+  reconcile), and the batch `PodScheduled=False` condition patch
+  (`GangPendingPodsConditionPatch`, post-v1.8.0, beta and enabled by default on current
+  main) is entirely unexercised; KWOK cannot
+  validate kubelet/koordlet/device paths; no scale or churn testing. Corrections and additional scenarios from Koordinator
+  maintainers are welcome — these are the most likely places for pipeline deviation.
+
 #### Acceptance Criteria
 
 - All unit tests pass with >80% code coverage for new components
@@ -835,10 +1022,17 @@ If issues arise during upgrade:
 ## Implementation History
 
 - [x] 14/01/2026: Proposed idea and initial draft proposal
+- [x] 08/2026: Phase 1 complete — Grove koord-scheduler backend implemented and validated
+  against Koordinator v1.8.0 (gang translation, CTB→ClusterNetworkTopology synchronisation,
+  ElasticQuota binding, per-workload gang timeout, per-clique QoS, rolling-update constraint
+  preservation); proposal updated with implementation status, issues encountered, and
+  follow-up scheduler enhancements (CP1–CP5)
 - [ ] XX/XX/2026: First round of feedback from Koordinator community
 - [ ] XX/XX/2026: Open proposal PR for formal review
 - [ ] XX/XX/2026: Address review comments and finalize proposal
-- [ ] XX/XX/2026: Begin implementation (alpha phase)
-  - Grove CRD integration
-  - Basic gang scheduling for PodGang
-  - Feature gate implementation
+- [ ] XX/XX/2026: Scheduler-side enhancements (CP1–CP5; native PodGang consumption as a
+  possible later phase)
+  - Per-sub-group NetworkTopologySpec within a GangGroup (CP1)
+  - Configurable / multiple ClusterNetworkTopology instances (CP3)
+  - Reservation integration for Grove rolling updates (CP4)
+  - Declarative contract for podCountMultiple contiguous placement (CP2)
